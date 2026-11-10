@@ -1,6 +1,0 @@
--Wno-frame-address
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero
-"-specs=/home/roni_maverick/ESP-projects/motorized-turntable/build/specs/picolibc.specs"

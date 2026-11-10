@@ -2,6 +2,7 @@
 // Includes
 // ============================================================
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -125,6 +126,55 @@ void app_main(void) {
       {0, -1, +1, 0}, {+1, 0, 0, -1}, {-1, 0, 0, +1}, {0, +1, -1, 0}};
 
   // ============================================================
+  // I2C Configurations
+  // ============================================================
+  // Bus Configuration
+  i2c_master_bus_config_t i2c_mst_config = {
+      .i2c_port = I2C_NUM_0,
+      .sda_io_num = GPIO_NUM_21,
+      .scl_io_num = GPIO_NUM_22,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .flags.enable_internal_pullup = true,
+  };
+
+  i2c_master_bus_handle_t i2c_bus_handle;
+  err = i2c_new_master_bus(&i2c_mst_config, &i2c_bus_handle);
+
+  if (err != ESP_OK) {
+    printf("Failed to register bus handle: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  printf("I2C bus initialised successfully!\n");
+
+  // OLED Configuration
+  i2c_device_config_t oled_config = {
+      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+      .device_address = 0x3C,
+      .scl_speed_hz = 100000,
+  };
+
+  i2c_master_dev_handle_t oled_handle;
+
+  err = i2c_master_bus_add_device(i2c_bus_handle, &oled_config, &oled_handle);
+
+  if (err != ESP_OK) {
+    printf("Failed to register OLED device: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  printf("OLED Device initialised successfully!\n");
+
+  err = i2c_master_probe(i2c_bus_handle, 0x3C, 100);
+
+  if (err != ESP_OK) {
+    printf("Failed to acknowledge OLED device: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  printf("OLED acknowledged at address 0x3C!\n");
+  // ============================================================
   // Main application loop
   // Button debounce and encoder event processing.
   // ============================================================
@@ -152,6 +202,12 @@ void app_main(void) {
       if (prev_state != encoder_info_rec_from_queue) {
         int direction =
             direction_table[prev_state][encoder_info_rec_from_queue];
+        // DEBUG LOG
+        printf("Transition: %d -> %d | Direction: %+d\n", prev_state,
+               encoder_info_rec_from_queue, direction);
+        printf("State: %d | CLK: %d | DT: %d\n", encoder_info_rec_from_queue,
+               (encoder_info_rec_from_queue >> 1) & 1,
+               encoder_info_rec_from_queue & 1);
         switch (direction) {
         case +1:
           increase_or_decrease_rpm(direction, &target_rpm);

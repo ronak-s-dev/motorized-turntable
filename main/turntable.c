@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -36,6 +37,58 @@ static void encoder_isr_handler(void *arg) {
   }
 
   portYIELD_FROM_ISR(higher_priority_task_woken);
+}
+
+// ============================================================
+// OLED: Send a single command to the SSD1306
+// ============================================================
+static esp_err_t oled_send_command(i2c_master_dev_handle_t oled_handle,
+                                   uint8_t command) {
+  // Byte 0: Control byte indicating a command
+  // Byte 1: Actual SSD1306 command
+  uint8_t buffer[2] = {0x00, command};
+
+  // Transmit both bytes over I2C
+  esp_err_t err = i2c_master_transmit(oled_handle, buffer, sizeof(buffer), 100);
+
+  return err;
+}
+
+static esp_err_t oled_send_commands(i2c_master_dev_handle_t oled_handle,
+                                    const uint8_t *commands, size_t length) {
+  uint8_t buffer[length + 1];
+
+  buffer[0] = 0x00;
+
+  for (size_t i = 0; i < length; i++) {
+    buffer[i + 1] = commands[i];
+  }
+
+  return i2c_master_transmit(oled_handle, buffer, sizeof(buffer), 100);
+}
+
+static esp_err_t oled_init(i2c_master_dev_handle_t oled_handle) {
+  esp_err_t err;
+
+  // Display OFF
+  err = oled_send_command(oled_handle, 0xAE);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  uint8_t clock_config[] = {0xD5, 0x80};
+
+  err = oled_send_commands(oled_handle, clock_config, 2);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  return ESP_OK;
 }
 
 void app_main(void) {
@@ -174,6 +227,16 @@ void app_main(void) {
   }
 
   printf("OLED acknowledged at address 0x3C!\n");
+
+  err = oled_init(oled_handle);
+
+  if (err != ESP_OK) {
+    printf("OLED initialisation failed: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  printf("OLED initialisation started successfully!\n");
+
   // ============================================================
   // Main application loop
   // Button debounce and encoder event processing.

@@ -17,11 +17,22 @@
 #include <stdio.h>
 
 // ============================================================
+// Function declarations
+// ============================================================
+void increase_or_decrease_rpm(int direction, int *rpm);
+esp_err_t motor_set_step_frequency(uint32_t frequency_hz);
+esp_err_t motor_start(uint32_t frequency_hz);
+esp_err_t motor_stop(void);
+uint32_t target_rpm_to_frequency(int target_rpm);
+
+// ============================================================
 // OLED Display Configuration
 // ============================================================
 // Globals
 // ============================================================
 // 5x7 Bitmap Font - Digits 0 to 9
+// Each digit consists of 7 rows, with 5 bits representing
+// the pixels in each row. A set bit represents an illuminated pixel.
 // ============================================================
 
 static const uint8_t digit_font[10][7] = {// 0
@@ -54,19 +65,25 @@ static const uint8_t digit_font[10][7] = {// 0
                                           // 9
                                           {14, 17, 17, 15, 1, 1, 14}};
 
+// SSD1306 display dimensions and framebuffer size.
+// Each byte stores 8 vertically adjacent pixels.
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
-
 #define OLED_BUFFER_SIZE (OLED_WIDTH * OLED_HEIGHT / 8)
 
+// Software framebuffer representing the entire OLED display.
 static uint8_t oled_buffer[OLED_BUFFER_SIZE];
 
+// Clears the entire software framebuffer.
+// Changes are sent to the physical display when oled_flush() is called.
 void oled_clear(void) {
   for (int i = 0; i < OLED_BUFFER_SIZE; i++) {
     oled_buffer[i] = 0x00;
   }
 }
 
+// Updates an individual pixel in the framebuffer.
+// Coordinates outside the display boundaries are ignored.
 void oled_draw_pixel(int x, int y, bool on) {
   if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
     return;
@@ -82,6 +99,7 @@ void oled_draw_pixel(int x, int y, bool on) {
   }
 }
 
+// Draws a 5x7 digit at the specified framebuffer coordinates.
 void oled_draw_digit(int x, int y, uint8_t digit) {
   if (digit > 9) {
     return;
@@ -96,26 +114,32 @@ void oled_draw_digit(int x, int y, uint8_t digit) {
   }
 }
 
+// Transfers the complete framebuffer to the SSD1306 display.
 esp_err_t oled_flush(esp_lcd_panel_handle_t panel) {
   return esp_lcd_panel_draw_bitmap(panel, 0, 0, OLED_WIDTH, OLED_HEIGHT,
                                    oled_buffer);
 }
 
 // ============================================================
-// MOTOR configuration
-// STEP: GPIO32
-// DIRECTION:  GPIO33
-// ENABLE:  GPIO23
+// Stepper Motor Configuration
 // ============================================================
+
+// STEP: GPIO32 - Receives pulse signals from MCPWM.
+// DIR:  GPIO33 - Selects motor rotation direction.
+// EN:   GPIO23 - Active LOW on the intended TMC2209 module.
 
 #define MOTOR_STEP_GPIO GPIO_NUM_32
 #define MOTOR_DIR_GPIO GPIO_NUM_33
 #define MOTOR_EN_GPIO GPIO_NUM_23
+#define MOTOR_MIN_STEP_FREQ_HZ 100
+#define MOTOR_MAX_STEP_FREQ_HZ 600
 
 // ============================================================
-// Function declarations
+// Encoder Interrupt Handling
 // ============================================================
-void increase_or_decrease_rpm(int direction, int *rpm);
+
+// Counts encoder events that could not be placed in the queue.
+// Useful for diagnosing queue congestion during development.
 
 static volatile uint32_t encoder_queue_overflows = 0;
 
@@ -125,6 +149,8 @@ static void encoder_isr_handler(void *arg) {
   int clk_state = gpio_get_level(GPIO_NUM_25);
   int dt_state = gpio_get_level(GPIO_NUM_26);
 
+  // Capture both quadrature signals and combine them into
+  // a two-bit encoder state: CLK in bit 1, DT in bit 0.
   uint8_t encoder_state = (clk_state << 1) | dt_state;
 
   BaseType_t higher_priority_task_woken = pdFALSE;
@@ -180,9 +206,14 @@ void app_main(void) {
   gpio_set_pull_mode(GPIO_NUM_27, GPIO_PULLUP_ONLY);
 
   // ============================================================
-  // MCPWM Configurations
+  // MCPWM Initialisation
   // ============================================================
-  // Motor direction and enable GPIO configuration
+
+  // Configure motor direction and enable signals as outputs.
+
+  // Keep the driver disabled during initialisation.
+  // TMC2209 EN is active LOW.
+
   gpio_set_direction(MOTOR_DIR_GPIO, GPIO_MODE_OUTPUT);
   gpio_set_direction(MOTOR_EN_GPIO, GPIO_MODE_OUTPUT);
 
@@ -192,12 +223,17 @@ void app_main(void) {
   // Set an initial direction
   gpio_set_level(MOTOR_DIR_GPIO, 0);
 
+  // Configure a 1 MHz timer resolution.
+  // Initial period: 10,000 ticks = 10 ms = 100 Hz.
+  // The timer counts upward and updates its period at the
+  // timer-empty event when a new period is requested.
   mcpwm_timer_config_t timer_config = {
       .group_id = 0,
       .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
       .resolution_hz = 1000000,
       .period_ticks = 10000,
       .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
+      .flags.update_period_on_empty = true,
   };
 
   err = mcpwm_new_timer(&timer_config, &motor_timer);
@@ -343,6 +379,8 @@ void app_main(void) {
 
   // ============================================================
   // I2C Configurations
+  // OLED SDA: GPIO21
+  // OLED SCL: GPIO22
   // ============================================================
   // Bus Configuration
   i2c_master_bus_config_t i2c_mst_config = {
@@ -451,8 +489,31 @@ void app_main(void) {
                              // unchanged for 100 ms
       stable_btn_state = candidate_btn_state;
       if (stable_btn_state == 0) {
-        motor_running = !motor_running;
-        printf("Motor state: %s\n", motor_running ? "RUNNING" : "STOPPED");
+        if (motor_running == 0) {
+          if (target_rpm > 0) {
+            uint32_t frequency_hz = target_rpm_to_frequency(target_rpm);
+            esp_err_t err = motor_start(frequency_hz);
+
+            if (err == ESP_OK) {
+              motor_running = 1;
+              printf("Motor started\n");
+            } else {
+              printf("Motor start failed: %s\n", esp_err_to_name(err));
+            }
+
+          } else {
+            printf("Cannot start: target RPM is at zero\n");
+          }
+        } else {
+          esp_err_t err = motor_stop();
+
+          if (err == ESP_OK) {
+            motor_running = 0;
+            printf("Motor stopped\n");
+          } else {
+            printf("Motor stop failed: %s\n", esp_err_to_name(err));
+          }
+        }
       }
     }
 
@@ -470,8 +531,6 @@ void app_main(void) {
                encoder_info_rec_from_queue & 1);
         switch (direction) {
         case +1:
-          increase_or_decrease_rpm(direction, &target_rpm);
-          break;
         case -1:
           increase_or_decrease_rpm(direction, &target_rpm);
           break;
@@ -482,6 +541,27 @@ void app_main(void) {
           }
           break;
         }
+        if (direction == 1 || direction == -1) {
+          if (motor_running && target_rpm > 0) {
+            uint32_t frequency_hz = target_rpm_to_frequency(target_rpm);
+
+            esp_err_t err = motor_set_step_frequency(frequency_hz);
+
+            if (err != ESP_OK) {
+              printf("Speed update failed: %s\n", esp_err_to_name(err));
+            }
+          } else if (motor_running && target_rpm == 0) {
+            esp_err_t err = motor_stop();
+
+            if (err == ESP_OK) {
+              motor_running = 0;
+              printf("Target RPM reached zero. Motor stopped.\n");
+            } else {
+              printf("Motor stop failed: %s\n", esp_err_to_name(err));
+            }
+          }
+        }
+
         prev_state = encoder_info_rec_from_queue;
       }
     }
@@ -516,4 +596,64 @@ void increase_or_decrease_rpm(int direction, int *rpm) {
     transition_count = 0;
   }
   printf("Target RPM: %d\n", *rpm);
+}
+
+esp_err_t motor_set_step_frequency(uint32_t frequency_hz) {
+  if (frequency_hz < MOTOR_MIN_STEP_FREQ_HZ ||
+      frequency_hz > MOTOR_MAX_STEP_FREQ_HZ) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  uint32_t period_ticks = 1000000 / frequency_hz;
+  uint32_t compare_ticks = period_ticks / 2;
+
+  esp_err_t err = mcpwm_timer_set_period(motor_timer, period_ticks);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = mcpwm_comparator_set_compare_value(motor_comparator, compare_ticks);
+
+  return err;
+}
+
+// Helper Functions for Motor Start / Stop Functionality
+esp_err_t motor_start(uint32_t frequency_hz) {
+  esp_err_t err = motor_set_step_frequency(frequency_hz);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = gpio_set_level(MOTOR_EN_GPIO, 0);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = mcpwm_timer_start_stop(motor_timer, MCPWM_TIMER_START_NO_STOP);
+
+  if (err != ESP_OK) {
+    gpio_set_level(MOTOR_EN_GPIO, 1);
+    return err;
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t motor_stop(void) {
+  esp_err_t err = mcpwm_timer_start_stop(motor_timer, MCPWM_TIMER_STOP_EMPTY);
+
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  err = gpio_set_level(MOTOR_EN_GPIO, 1);
+
+  return err;
+}
+
+uint32_t target_rpm_to_frequency(int target_rpm) {
+  return 100 + (target_rpm * 5);
 }

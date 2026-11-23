@@ -19,11 +19,13 @@
 // ============================================================
 // Function declarations
 // ============================================================
+static esp_err_t check_gpio_error(esp_err_t err, const char *operation);
 void increase_or_decrease_rpm(int direction, int *rpm);
 esp_err_t motor_set_step_frequency(uint32_t frequency_hz);
 esp_err_t motor_start(uint32_t frequency_hz);
 esp_err_t motor_stop(void);
 uint32_t target_rpm_to_frequency(int target_rpm);
+void motor_ramp_update(void);
 
 // ============================================================
 // OLED Display Configuration
@@ -133,6 +135,8 @@ esp_err_t oled_flush(esp_lcd_panel_handle_t panel) {
 #define MOTOR_EN_GPIO GPIO_NUM_23
 #define MOTOR_MIN_STEP_FREQ_HZ 100
 #define MOTOR_MAX_STEP_FREQ_HZ 600
+#define MOTOR_RAMP_STEP_HZ 5
+#define MOTOR_RAMP_INTERVAL_US 100000
 
 // ============================================================
 // Encoder Interrupt Handling
@@ -170,6 +174,11 @@ static mcpwm_timer_handle_t motor_timer = NULL;
 static mcpwm_oper_handle_t motor_operator = NULL;
 static mcpwm_cmpr_handle_t motor_comparator = NULL;
 static mcpwm_gen_handle_t motor_generator = NULL;
+static uint32_t current_frequency_hz = 0;
+static uint32_t target_frequency_hz = 0;
+static int64_t last_ramp_update_us = 0;
+static int motor_running = 0;
+static bool motor_timer_running = false;
 
 void app_main(void) {
   printf("Motorized Turntable Program Started....\n");
@@ -191,37 +200,73 @@ void app_main(void) {
   // DT:  GPIO26
   // SW:  GPIO27
   // ============================================================
-  gpio_reset_pin(GPIO_NUM_25);
-  gpio_set_direction(GPIO_NUM_25, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(GPIO_NUM_25, GPIO_PULLUP_ONLY);
-  gpio_set_intr_type(GPIO_NUM_25, GPIO_INTR_ANYEDGE);
 
-  gpio_reset_pin(GPIO_NUM_26);
-  gpio_set_direction(GPIO_NUM_26, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(GPIO_NUM_26, GPIO_PULLUP_ONLY);
-  gpio_set_intr_type(GPIO_NUM_26, GPIO_INTR_ANYEDGE);
+  // Configure encoder CLK
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_reset_pin(GPIO_NUM_25), "reset encoder CLK"));
 
-  gpio_reset_pin(GPIO_NUM_27);
-  gpio_set_direction(GPIO_NUM_27, GPIO_MODE_INPUT);
-  gpio_set_pull_mode(GPIO_NUM_27, GPIO_PULLUP_ONLY);
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_direction(GPIO_NUM_25, GPIO_MODE_INPUT),
+                       "configure encoder CLK direction"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_pull_mode(GPIO_NUM_25, GPIO_PULLUP_ONLY),
+                       "configure encoder CLK pull-up"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_intr_type(GPIO_NUM_25, GPIO_INTR_ANYEDGE),
+                       "configure encoder CLK interrupt"));
+
+  // Configure encoder DT
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_reset_pin(GPIO_NUM_26), "reset encoder DT"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_direction(GPIO_NUM_26, GPIO_MODE_INPUT),
+                       "configure encoder DT direction"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_pull_mode(GPIO_NUM_26, GPIO_PULLUP_ONLY),
+                       "configure encoder DT pull-up"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_intr_type(GPIO_NUM_26, GPIO_INTR_ANYEDGE),
+                       "configure encoder DT interrupt"));
+
+  // Configure encoder push button
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_reset_pin(GPIO_NUM_27), "reset encoder button"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_direction(GPIO_NUM_27, GPIO_MODE_INPUT),
+                       "configure encoder button direction"));
+
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_pull_mode(GPIO_NUM_27, GPIO_PULLUP_ONLY),
+                       "configure encoder button pull-up"));
 
   // ============================================================
   // MCPWM Initialisation
   // ============================================================
 
   // Configure motor direction and enable signals as outputs.
-
-  // Keep the driver disabled during initialisation.
   // TMC2209 EN is active LOW.
 
-  gpio_set_direction(MOTOR_DIR_GPIO, GPIO_MODE_OUTPUT);
-  gpio_set_direction(MOTOR_EN_GPIO, GPIO_MODE_OUTPUT);
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_direction(MOTOR_DIR_GPIO, GPIO_MODE_OUTPUT),
+                       "configure motor direction"));
 
-  // Start with the motor driver disabled
-  gpio_set_level(MOTOR_EN_GPIO, 1);
+  ESP_ERROR_CHECK(
+      check_gpio_error(gpio_set_direction(MOTOR_EN_GPIO, GPIO_MODE_OUTPUT),
+                       "configure motor enable"));
 
-  // Set an initial direction
-  gpio_set_level(MOTOR_DIR_GPIO, 0);
+  // Keep the motor driver disabled during initialisation.
+  ESP_ERROR_CHECK(check_gpio_error(gpio_set_level(MOTOR_EN_GPIO, 1),
+                                   "disable motor driver"));
+
+  // Set the initial motor direction.
+  ESP_ERROR_CHECK(check_gpio_error(gpio_set_level(MOTOR_DIR_GPIO, 0),
+                                   "set initial motor direction"));
 
   // Configure a 1 MHz timer resolution.
   // Initial period: 10,000 ticks = 10 ms = 100 Hz.
@@ -327,7 +372,6 @@ void app_main(void) {
   // ============================================================
   // Locals
   int target_rpm = 0;
-  int motor_running = 0;
 
   // Button debounce state
   int curr_btn_state = gpio_get_level(GPIO_NUM_27);
@@ -491,11 +535,14 @@ void app_main(void) {
       if (stable_btn_state == 0) {
         if (motor_running == 0) {
           if (target_rpm > 0) {
-            uint32_t frequency_hz = target_rpm_to_frequency(target_rpm);
-            esp_err_t err = motor_start(frequency_hz);
+            target_frequency_hz = target_rpm_to_frequency(target_rpm);
+            esp_err_t err = motor_start(MOTOR_MIN_STEP_FREQ_HZ);
 
             if (err == ESP_OK) {
+              current_frequency_hz = MOTOR_MIN_STEP_FREQ_HZ;
               motor_running = 1;
+              last_ramp_update_us = esp_timer_get_time();
+
               printf("Motor started\n");
             } else {
               printf("Motor start failed: %s\n", esp_err_to_name(err));
@@ -505,14 +552,8 @@ void app_main(void) {
             printf("Cannot start: target RPM is at zero\n");
           }
         } else {
-          esp_err_t err = motor_stop();
-
-          if (err == ESP_OK) {
-            motor_running = 0;
-            printf("Motor stopped\n");
-          } else {
-            printf("Motor stop failed: %s\n", esp_err_to_name(err));
-          }
+          target_frequency_hz = 0;
+          printf("Motor stopping...\n");
         }
       }
     }
@@ -542,30 +583,28 @@ void app_main(void) {
           break;
         }
         if (direction == 1 || direction == -1) {
-          if (motor_running && target_rpm > 0) {
-            uint32_t frequency_hz = target_rpm_to_frequency(target_rpm);
-
-            esp_err_t err = motor_set_step_frequency(frequency_hz);
-
-            if (err != ESP_OK) {
-              printf("Speed update failed: %s\n", esp_err_to_name(err));
-            }
-          } else if (motor_running && target_rpm == 0) {
-            esp_err_t err = motor_stop();
-
-            if (err == ESP_OK) {
-              motor_running = 0;
-              printf("Target RPM reached zero. Motor stopped.\n");
-            } else {
-              printf("Motor stop failed: %s\n", esp_err_to_name(err));
-            }
+          if (target_rpm > 0) {
+            target_frequency_hz = target_rpm_to_frequency(target_rpm);
+          } else {
+            target_frequency_hz = 0;
           }
         }
-
-        prev_state = encoder_info_rec_from_queue;
       }
+      prev_state = encoder_info_rec_from_queue;
     }
+
+    motor_ramp_update();
   }
+}
+
+// Helper Function to Validate GPIO Pins
+static esp_err_t check_gpio_error(esp_err_t err, const char *operation) {
+
+  if (err != ESP_OK) {
+    printf("GPIO error during %s: %s\n", operation, esp_err_to_name(err));
+  }
+
+  return err;
 }
 
 // Accumulates four valid quadrature transitions
@@ -599,27 +638,74 @@ void increase_or_decrease_rpm(int direction, int *rpm) {
 }
 
 esp_err_t motor_set_step_frequency(uint32_t frequency_hz) {
+
+  // Reject frequencies outside the supported operating range
   if (frequency_hz < MOTOR_MIN_STEP_FREQ_HZ ||
       frequency_hz > MOTOR_MAX_STEP_FREQ_HZ) {
     return ESP_ERR_INVALID_ARG;
   }
 
+  // Calculate the new timer period and 50% duty-cycle compare value
   uint32_t period_ticks = 1000000 / frequency_hz;
   uint32_t compare_ticks = period_ticks / 2;
 
+  // Remember the previous configuration for rollback
+  uint32_t previous_frequency_hz = (current_frequency_hz == 0)
+                                       ? MOTOR_MIN_STEP_FREQ_HZ
+                                       : current_frequency_hz;
+
+  uint32_t previous_period_ticks = 1000000 / previous_frequency_hz;
+
+  uint32_t previous_compare_ticks = previous_period_ticks / 2;
+
+  // Update the timer period first
   esp_err_t err = mcpwm_timer_set_period(motor_timer, period_ticks);
 
   if (err != ESP_OK) {
+    printf("MCPWM period update failed: %s\n", esp_err_to_name(err));
     return err;
   }
 
+  // Update the comparator value
   err = mcpwm_comparator_set_compare_value(motor_comparator, compare_ticks);
 
-  return err;
+  if (err != ESP_OK) {
+
+    printf("MCPWM comparator update failed: %s\n", esp_err_to_name(err));
+
+    // Attempt to restore the previous timer period
+    esp_err_t rollback_period_err =
+        mcpwm_timer_set_period(motor_timer, previous_period_ticks);
+
+    // Attempt to restore the previous comparator value
+    esp_err_t rollback_compare_err = mcpwm_comparator_set_compare_value(
+        motor_comparator, previous_compare_ticks);
+
+    // If rollback fails, stop the motor as a precaution
+    if (rollback_period_err != ESP_OK || rollback_compare_err != ESP_OK) {
+
+      printf("WARNING: MCPWM rollback failed!\n");
+
+      esp_err_t stop_err = motor_stop();
+
+      if (stop_err == ESP_OK) {
+        current_frequency_hz = 0;
+        motor_running = 0;
+      } else {
+        printf("WARNING: Motor shutdown also failed: %s\n",
+               esp_err_to_name(stop_err));
+      }
+    }
+
+    return err;
+  }
+
+  return ESP_OK;
 }
 
 // Helper Functions for Motor Start / Stop Functionality
 esp_err_t motor_start(uint32_t frequency_hz) {
+
   esp_err_t err = motor_set_step_frequency(frequency_hz);
 
   if (err != ESP_OK) {
@@ -635,25 +721,129 @@ esp_err_t motor_start(uint32_t frequency_hz) {
   err = mcpwm_timer_start_stop(motor_timer, MCPWM_TIMER_START_NO_STOP);
 
   if (err != ESP_OK) {
-    gpio_set_level(MOTOR_EN_GPIO, 1);
+    esp_err_t disable_err = gpio_set_level(MOTOR_EN_GPIO, 1);
+
+    if (disable_err != ESP_OK) {
+      printf("WARNING: Failed to disable motor driver!\n");
+    }
+
     return err;
   }
+
+  motor_timer_running = true;
 
   return ESP_OK;
 }
 
 esp_err_t motor_stop(void) {
-  esp_err_t err = mcpwm_timer_start_stop(motor_timer, MCPWM_TIMER_STOP_EMPTY);
 
-  if (err != ESP_OK) {
-    return err;
+  esp_err_t err = ESP_OK;
+
+  // Stop MCPWM only if its timer is currently running
+  if (motor_timer_running) {
+
+    err = mcpwm_timer_start_stop(motor_timer, MCPWM_TIMER_STOP_EMPTY);
+
+    if (err != ESP_OK) {
+      printf("MCPWM stop failed: %s\n", esp_err_to_name(err));
+    } else {
+      motor_timer_running = false;
+    }
   }
 
-  err = gpio_set_level(MOTOR_EN_GPIO, 1);
+  // Always attempt to disable the motor driver
+  esp_err_t disable_err = gpio_set_level(MOTOR_EN_GPIO, 1);
+
+  if (disable_err != ESP_OK) {
+    printf("Motor driver disable failed: %s\n", esp_err_to_name(disable_err));
+
+    return disable_err;
+  }
 
   return err;
 }
 
 uint32_t target_rpm_to_frequency(int target_rpm) {
   return 100 + (target_rpm * 5);
+}
+
+void motor_ramp_update(void) {
+  int64_t now_us = esp_timer_get_time();
+
+  // Wait until the ramp update interval has elapsed
+  if ((now_us - last_ramp_update_us) < MOTOR_RAMP_INTERVAL_US) {
+    return;
+  }
+
+  last_ramp_update_us = now_us;
+
+  uint32_t next_frequency_hz = current_frequency_hz;
+
+  // --------------------------------------------------------
+  // Acceleration
+  // --------------------------------------------------------
+  if (current_frequency_hz < target_frequency_hz) {
+
+    if (next_frequency_hz == 0) {
+      next_frequency_hz = MOTOR_MIN_STEP_FREQ_HZ;
+    } else {
+      next_frequency_hz += MOTOR_RAMP_STEP_HZ;
+    }
+
+    // Prevent overshooting the target
+    if (next_frequency_hz > target_frequency_hz) {
+      next_frequency_hz = target_frequency_hz;
+    }
+  }
+
+  // --------------------------------------------------------
+  // Deceleration
+  // --------------------------------------------------------
+  else if (current_frequency_hz > target_frequency_hz) {
+
+    if (target_frequency_hz == 0 &&
+        current_frequency_hz <= MOTOR_MIN_STEP_FREQ_HZ) {
+
+      next_frequency_hz = 0;
+
+    } else {
+      next_frequency_hz -= MOTOR_RAMP_STEP_HZ;
+    }
+
+    // Prevent undershooting a non-zero target
+    if (next_frequency_hz < target_frequency_hz) {
+      next_frequency_hz = target_frequency_hz;
+    }
+  }
+
+  // Nothing to update
+  if (next_frequency_hz == current_frequency_hz) {
+    return;
+  }
+
+  // --------------------------------------------------------
+  // Apply the new frequency or stop the motor
+  // --------------------------------------------------------
+  if (next_frequency_hz == 0) {
+
+    esp_err_t err = motor_stop();
+
+    if (err == ESP_OK) {
+      current_frequency_hz = 0;
+      motor_running = 0;
+      printf("Motor stopped\n");
+    } else {
+      printf("Motor stop failed: %s\n", esp_err_to_name(err));
+    }
+
+  } else {
+
+    esp_err_t err = motor_set_step_frequency(next_frequency_hz);
+
+    if (err == ESP_OK) {
+      current_frequency_hz = next_frequency_hz;
+    } else {
+      printf("Motor frequency update failed: %s\n", esp_err_to_name(err));
+    }
+  }
 }

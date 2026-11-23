@@ -3,14 +3,114 @@
 // ============================================================
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/mcpwm_prelude.h"
 #include "esp_err.h"
+#include "esp_lcd_io_i2c.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_ssd1306.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+
+// ============================================================
+// OLED Display Configuration
+// ============================================================
+// Globals
+// ============================================================
+// 5x7 Bitmap Font - Digits 0 to 9
+// ============================================================
+
+static const uint8_t digit_font[10][7] = {// 0
+                                          {14, 17, 17, 17, 17, 17, 14},
+
+                                          // 1
+                                          {4, 12, 4, 4, 4, 4, 14},
+
+                                          // 2
+                                          {14, 17, 1, 2, 4, 8, 31},
+
+                                          // 3
+                                          {30, 1, 1, 14, 1, 1, 30},
+
+                                          // 4
+                                          {2, 6, 10, 18, 31, 2, 2},
+
+                                          // 5
+                                          {31, 16, 16, 30, 1, 1, 30},
+
+                                          // 6
+                                          {14, 16, 16, 30, 17, 17, 14},
+
+                                          // 7
+                                          {31, 1, 2, 4, 8, 8, 8},
+
+                                          // 8
+                                          {14, 17, 17, 14, 17, 17, 14},
+
+                                          // 9
+                                          {14, 17, 17, 15, 1, 1, 14}};
+
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+#define OLED_BUFFER_SIZE (OLED_WIDTH * OLED_HEIGHT / 8)
+
+static uint8_t oled_buffer[OLED_BUFFER_SIZE];
+
+void oled_clear(void) {
+  for (int i = 0; i < OLED_BUFFER_SIZE; i++) {
+    oled_buffer[i] = 0x00;
+  }
+}
+
+void oled_draw_pixel(int x, int y, bool on) {
+  if (x < 0 || x >= OLED_WIDTH || y < 0 || y >= OLED_HEIGHT) {
+    return;
+  }
+
+  int index = (y / 8) * OLED_WIDTH + x;
+  uint8_t mask = 1 << (y % 8);
+
+  if (on) {
+    oled_buffer[index] |= mask;
+  } else {
+    oled_buffer[index] &= ~mask;
+  }
+}
+
+void oled_draw_digit(int x, int y, uint8_t digit) {
+  if (digit > 9) {
+    return;
+  }
+
+  for (int row = 0; row < 7; row++) {
+    for (int col = 0; col < 5; col++) {
+      if (digit_font[digit][row] & (1 << (4 - col))) {
+        oled_draw_pixel(x + col, y + row, true);
+      }
+    }
+  }
+}
+
+esp_err_t oled_flush(esp_lcd_panel_handle_t panel) {
+  return esp_lcd_panel_draw_bitmap(panel, 0, 0, OLED_WIDTH, OLED_HEIGHT,
+                                   oled_buffer);
+}
+
+// ============================================================
+// MOTOR configuration
+// STEP: GPIO32
+// DIRECTION:  GPIO33
+// ENABLE:  GPIO23
+// ============================================================
+
+#define MOTOR_STEP_GPIO GPIO_NUM_32
+#define MOTOR_DIR_GPIO GPIO_NUM_33
+#define MOTOR_EN_GPIO GPIO_NUM_23
 
 // ============================================================
 // Function declarations
@@ -39,61 +139,16 @@ static void encoder_isr_handler(void *arg) {
   portYIELD_FROM_ISR(higher_priority_task_woken);
 }
 
-// ============================================================
-// OLED: Send a single command to the SSD1306
-// ============================================================
-static esp_err_t oled_send_command(i2c_master_dev_handle_t oled_handle,
-                                   uint8_t command) {
-  // Byte 0: Control byte indicating a command
-  // Byte 1: Actual SSD1306 command
-  uint8_t buffer[2] = {0x00, command};
-
-  // Transmit both bytes over I2C
-  esp_err_t err = i2c_master_transmit(oled_handle, buffer, sizeof(buffer), 100);
-
-  return err;
-}
-
-static esp_err_t oled_send_commands(i2c_master_dev_handle_t oled_handle,
-                                    const uint8_t *commands, size_t length) {
-  uint8_t buffer[length + 1];
-
-  buffer[0] = 0x00;
-
-  for (size_t i = 0; i < length; i++) {
-    buffer[i + 1] = commands[i];
-  }
-
-  return i2c_master_transmit(oled_handle, buffer, sizeof(buffer), 100);
-}
-
-static esp_err_t oled_init(i2c_master_dev_handle_t oled_handle) {
-  esp_err_t err;
-
-  // Display OFF
-  err = oled_send_command(oled_handle, 0xAE);
-
-  if (err != ESP_OK) {
-    return err;
-  }
-
-  uint8_t clock_config[] = {0xD5, 0x80};
-
-  err = oled_send_commands(oled_handle, clock_config, 2);
-
-  if (err != ESP_OK) {
-    return err;
-  }
-  if (err != ESP_OK) {
-    return err;
-  }
-
-  return ESP_OK;
-}
+// Timer Handle for Stepper Motor
+static mcpwm_timer_handle_t motor_timer = NULL;
+static mcpwm_oper_handle_t motor_operator = NULL;
+static mcpwm_cmpr_handle_t motor_comparator = NULL;
+static mcpwm_gen_handle_t motor_generator = NULL;
 
 void app_main(void) {
   printf("Motorized Turntable Program Started....\n");
 
+  esp_err_t err = ESP_OK;
   // ============================================================
   // Encoder queue
   // Stores captured quadrature states in FIFO order.
@@ -125,9 +180,116 @@ void app_main(void) {
   gpio_set_pull_mode(GPIO_NUM_27, GPIO_PULLUP_ONLY);
 
   // ============================================================
+  // MCPWM Configurations
+  // ============================================================
+  // Motor direction and enable GPIO configuration
+  gpio_set_direction(MOTOR_DIR_GPIO, GPIO_MODE_OUTPUT);
+  gpio_set_direction(MOTOR_EN_GPIO, GPIO_MODE_OUTPUT);
+
+  // Start with the motor driver disabled
+  gpio_set_level(MOTOR_EN_GPIO, 1);
+
+  // Set an initial direction
+  gpio_set_level(MOTOR_DIR_GPIO, 0);
+
+  mcpwm_timer_config_t timer_config = {
+      .group_id = 0,
+      .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
+      .resolution_hz = 1000000,
+      .period_ticks = 10000,
+      .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
+  };
+
+  err = mcpwm_new_timer(&timer_config, &motor_timer);
+
+  if (err != ESP_OK) {
+    printf("Failed to create MCPWM timer: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  // MCPWM operator configuration
+  mcpwm_operator_config_t operator_config = {
+      .group_id = 0,
+  };
+
+  err = mcpwm_new_operator(&operator_config, &motor_operator);
+
+  if (err != ESP_OK) {
+    printf("Failed to create MCPWM operator: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = mcpwm_operator_connect_timer(motor_operator, motor_timer);
+
+  if (err != ESP_OK) {
+    printf("Failed to connect MCPWM operator to timer: %s\n",
+           esp_err_to_name(err));
+    return;
+  }
+
+  mcpwm_comparator_config_t comparator_config = {
+      .flags.update_cmp_on_tez = true,
+  };
+
+  err = mcpwm_new_comparator(motor_operator, &comparator_config,
+                             &motor_comparator);
+
+  if (err != ESP_OK) {
+    printf("Failed to create MCPWM comparator: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  // MCPWM generator configuration
+  mcpwm_generator_config_t generator_config = {
+      .gen_gpio_num = MOTOR_STEP_GPIO,
+  };
+
+  err =
+      mcpwm_new_generator(motor_operator, &generator_config, &motor_generator);
+
+  if (err != ESP_OK) {
+    printf("Failed to create MCPWM generator: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = mcpwm_generator_set_action_on_timer_event(
+      motor_generator, MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                                    MCPWM_TIMER_EVENT_EMPTY,
+                                                    MCPWM_GEN_ACTION_HIGH));
+
+  if (err != ESP_OK) {
+    printf("Failed to configure STEP rising edge: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = mcpwm_generator_set_action_on_compare_event(
+      motor_generator,
+      MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motor_comparator,
+                                     MCPWM_GEN_ACTION_LOW));
+
+  if (err != ESP_OK) {
+    printf("Failed to configure STEP falling edge: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = mcpwm_comparator_set_compare_value(motor_comparator, 5000);
+
+  if (err != ESP_OK) {
+    printf("Failed to set comparator value: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = mcpwm_timer_enable(motor_timer);
+
+  if (err != ESP_OK) {
+    printf("Failed to enable MCPWM timer: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  // ============================================================
   // Initial encoder and button states
   // ============================================================
-  // // Locals
+  // Locals
   int target_rpm = 0;
   int motor_running = 0;
 
@@ -147,7 +309,8 @@ void app_main(void) {
   // ============================================================
   // GPIO interrupt service and handler registration
   // ============================================================
-  esp_err_t err = gpio_install_isr_service(0);
+
+  err = gpio_install_isr_service(0);
 
   if (err != ESP_OK) {
     printf("Failed to install GPIO ISR service: %s\n", esp_err_to_name(err));
@@ -202,40 +365,74 @@ void app_main(void) {
   printf("I2C bus initialised successfully!\n");
 
   // OLED Configuration
-  i2c_device_config_t oled_config = {
-      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-      .device_address = 0x3C,
+  // ============================================================
+  // OLED: I2C Panel IO Configuration
+  // ============================================================
+  esp_lcd_panel_io_handle_t oled_io_handle = NULL;
+
+  esp_lcd_panel_io_i2c_config_t io_config = {
+      .dev_addr = 0x3C,
       .scl_speed_hz = 100000,
+      .control_phase_bytes = 1,
+      .dc_bit_offset = 6,
+      .lcd_cmd_bits = 8,
+      .lcd_param_bits = 8,
+      .on_color_trans_done = NULL,
+      .user_ctx = NULL,
+      .flags =
+          {
+              .dc_low_on_data = false,
+              .disable_control_phase = false,
+          },
+      .transaction_timeout_ms = 100,
   };
 
-  i2c_master_dev_handle_t oled_handle;
-
-  err = i2c_master_bus_add_device(i2c_bus_handle, &oled_config, &oled_handle);
+  err = esp_lcd_new_panel_io_i2c(i2c_bus_handle, &io_config, &oled_io_handle);
 
   if (err != ESP_OK) {
-    printf("Failed to register OLED device: %s\n", esp_err_to_name(err));
+    printf("Failed to create OLED panel IO: %s\n", esp_err_to_name(err));
     return;
   }
 
-  printf("OLED Device initialised successfully!\n");
+  // ============================================================
+  // OLED: SSD1306 Panel Configuration
+  // ============================================================
+  esp_lcd_panel_ssd1306_config_t ssd1306_config = {
+      .height = OLED_HEIGHT,
+      .contrast = 128,
+  };
 
-  err = i2c_master_probe(i2c_bus_handle, 0x3C, 100);
+  esp_lcd_panel_dev_config_t panel_config = {
+      .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+      .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
+      .bits_per_pixel = 1,
+      .reset_gpio_num = GPIO_NUM_NC,
+      .vendor_config = &ssd1306_config,
+  };
+
+  esp_lcd_panel_handle_t oled_panel_handle = NULL;
+
+  err = esp_lcd_new_panel_ssd1306(oled_io_handle, &panel_config,
+                                  &oled_panel_handle);
 
   if (err != ESP_OK) {
-    printf("Failed to acknowledge OLED device: %s\n", esp_err_to_name(err));
+    printf("Failed to create SSD1306 panel: %s\n", esp_err_to_name(err));
     return;
   }
 
-  printf("OLED acknowledged at address 0x3C!\n");
+  // ============================================================
+  // OLED: Reset and Initialise
+  // ============================================================
 
-  err = oled_init(oled_handle);
+  oled_clear();
+  err = oled_flush(oled_panel_handle);
 
   if (err != ESP_OK) {
-    printf("OLED initialisation failed: %s\n", esp_err_to_name(err));
+    printf("OLED framebuffer transfer failed!\n");
     return;
   }
 
-  printf("OLED initialisation started successfully!\n");
+  printf("OLED panel initialised and switched on!\n");
 
   // ============================================================
   // Main application loop
